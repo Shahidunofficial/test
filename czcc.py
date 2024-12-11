@@ -99,3 +99,42 @@ def periodic_sensor_data_request(self):
         except Exception as e:
             logging.error(f"Error in periodic sensor data request: {str(e)}")
             time.sleep(1)
+def serial_monitor():
+    SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
+    SERIAL_BAUDRATE = int(os.getenv('SERIAL_BAUDRATE', '115200'))
+    
+    while True:
+        try:
+            with Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1) as ser:
+                print(f"\n=== Serial Monitor Started on {SERIAL_PORT} ===")
+                while True:
+                    if ser.in_waiting:
+                        raw_data = ser.readline()
+                        try:
+                            print(f">>> {raw_data.decode()}", end='')
+                        except:
+                            print(f">>> {raw_data}")
+                    time.sleep(0.1)
+                    
+        except Exception as e:
+            print(f"Serial monitor error: {str(e)}")
+            time.sleep(5)
+
+def main():
+    configure_app()
+    
+    # Start serial monitor in a separate thread
+    serial_monitor_thread = threading.Thread(target=serial_monitor, daemon=True)
+    serial_monitor_thread.start()
+    
+    # Start sensor monitoring in a separate thread
+    sensor_thread = threading.Thread(target=start_sensor_monitoring, daemon=True)
+    sensor_thread.start()
+    
+    # Start the server
+    port = int(os.getenv('PORT', 8080))
+    host = os.getenv('HOST', '0.0.0.0')
+    debug = os.getenv('DEBUG', 'False').lower() == 'true'
+    
+    print(f"Server starting on {host}:{port}")
+    app.run(host=host, port=port, debug=debug)
