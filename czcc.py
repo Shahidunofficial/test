@@ -423,8 +423,7 @@ class NodeController:
                                         if received_status == "97":  # Acknowledge code
                                             response_received = True
                                             # Remove node from database and local storage
-                                            self.node_model.objects(node_id=node_id).delete()
-                                            self.node_model.local_storage.remove_node(node_id)
+                                            self.node_model.delete_node(node_id)
                                             return jsonify({'message': 'Node unenrolled successfully'}), 200
                                         elif received_status == "87":  # Error code
                                             response_received = True
