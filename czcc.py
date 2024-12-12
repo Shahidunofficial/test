@@ -1,3 +1,135 @@
+from mongoengine import Document, StringField, DateTimeField
+from datetime import datetime
+import logging
+from helper.local_storage import LocalStorage
+
+class NodeModel(Document):
+    node_id = StringField(required=True)
+    gateway_id = StringField(required=True)
+    relay1_state = StringField(default='0')
+    relay2_state = StringField(default='0')
+    timestamp = DateTimeField(default=datetime.utcnow)
+
+    meta = {'collection': 'nodes'}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.local_storage = LocalStorage()
+
+    def to_dict(self):
+        return {
+            'node_id': self.node_id,
+            'gateway_id': self.gateway_id,
+            'relay1_state': self.relay1_state,
+            'relay2_state': self.relay2_state,
+            'timestamp': self.timestamp.isoformat()
+        }
+
+    @classmethod
+    def save_node(cls, node_id, gateway_id):
+        try:
+            # Save to MongoDB
+            node = cls(
+                node_id=node_id,
+                gateway_id=gateway_id
+            )
+            node.save()
+            
+            # Save to local storage
+            node_dict = node.to_dict()
+            logging.debug(f"Saving node to local storage: {node_dict}")
+            node.local_storage.add_node(node_dict)
+            
+            return node_dict
+        except Exception as e:
+            logging.error(f"Error saving node: {str(e)}")
+            # If MongoDB fails, still save locally
+            node_dict = {
+                'node_id': node_id,
+                'gateway_id': gateway_id,
+                'relay1_state': '0',
+                'relay2_state': '0',
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            logging.debug(f"Saving node to local storage after MongoDB failure: {node_dict}")
+            node.local_storage.add_node(node_dict)
+            return node_dict
+
+    @classmethod
+    def get_all_nodes(cls):
+        try:
+            # Try MongoDB first
+            nodes = cls.objects.all()
+            return [node.to_dict() for node in nodes]
+        except Exception as e:
+            logging.warning(f"Failed to get nodes from MongoDB: {str(e)}")
+            # Fall back to local storage
+            local_storage = LocalStorage()
+            return local_storage.get_all_nodes()
+
+    def update_relay_state(self, node_id, relay_field, state):
+        try:
+            # Update in MongoDB
+            node = NodeModel.objects(node_id=node_id).first()
+            if node:
+                if relay_field == 'relay1_state':
+                    node.relay1_state = state
+                elif relay_field == 'relay2_state':
+                    node.relay2_state = state
+                node.save()
+                
+                # Update in local storage
+                local_storage = LocalStorage()
+                nodes = local_storage.get_all_nodes()
+                for stored_node in nodes:
+                    if stored_node['node_id'] == node_id:
+                        stored_node[relay_field] = state
+                        break
+                local_storage.save_nodes()
+                
+                return True
+            return False
+        except Exception as e:
+            logging.error(f"Error updating relay state: {str(e)}")
+            
+            # Try updating local storage even if MongoDB fails
+            try:
+                local_storage = LocalStorage()
+                nodes = local_storage.get_all_nodes()
+                for stored_node in nodes:
+                    if stored_node['node_id'] == node_id:
+                        stored_node[relay_field] = state
+                        break
+                local_storage.save_nodes()
+                return True
+            except Exception as local_error:
+                logging.error(f"Error updating local storage: {str(local_error)}")
+                return False
+
+    @classmethod
+    def node_exists(cls, node_id):
+        try:
+            return cls.objects(node_id=node_id).first() is not None
+        except Exception as e:
+            logging.error(f"Error checking node existence: {str(e)}")
+            return False
+
+    @classmethod
+    def delete_node(cls, node_id):
+        try:
+            # Delete from MongoDB
+            cls.objects(node_id=node_id).delete()
+            
+            # Delete from local storage
+            local_storage = LocalStorage()
+            local_storage.remove_node(node_id)
+            return True
+        except Exception as e:
+            logging.error(f"Error deleting node: {str(e)}")
+            return False
+
+            
+????
 import serial.tools.list_ports
 from serial import Serial, SerialException
 from flask import jsonify
@@ -147,96 +279,103 @@ class NodeController:
     def control_relay(self, data):
         node_id = data.get('nodeId')
         relay_number = data.get('relayNumber')  # Should be 1 or 2
-        relay_state = data.get('relayState') # Should be '0' or '1'
-        state = data.get('state-code') 
-
+        relay_state = data.get('relayState')    # Should be '0' or '1'
+        state = data.get('state')               # Control code
+        
         # Validate inputs
-        if not node_id or relay_number not in [1, 2] or relay_state not in ['0', '1']:
+        if not node_id or relay_number not in [1, 2] or relay_state not in ['0', '1'] or not state:
             return jsonify({'message': 'Invalid input parameters'}), 400
 
+        self.pause_sensor_request.set()  # Pause sensor data requests
+        
         try:
-            # Open serial connection
-            ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=10)
-            logging.info(f"Successfully opened serial port {self.SERIAL_PORT}")
-            
-            # Clear buffers
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            
-            # Format relay command (00 for relay1, 01 for relay2)
-            relay_code = '00' if relay_number == 1 else '01'
-            message = f"{node_id}{self.GATEWAY_ID}{state}{relay_code}{relay_state}"
-            hex_message = message.encode('ascii').hex()
-            
-            # Format AT command
-            at_command = f"AT+PSEND={hex_message}\r\n"
-            logging.debug(f"Sending command: {at_command}")
-            
-            # Send command
-            ser.write(at_command.encode('ascii'))
-            
-            # Wait for response with timeout
-            start_time = time.time()
-            while (time.time() - start_time) < 10:  # 10 second timeout
-                if ser.in_waiting:
-                    response = ser.readline().decode('ascii').strip()
-                    logging.debug(f"Received response: {response}")
-                    
-                    if "EVT:RXP2P" in response:
-                        parts = response.split(':')
-                        if len(parts) >= 5:
-                            hex_data = parts[4].strip()
-                            try:
-                                ascii_response = bytes.fromhex(hex_data).decode('ascii')
-                                received_node_id = ascii_response[:7]
-                                received_status = ascii_response[14:]
-                                
-                                if received_node_id == node_id:
-                                    if received_status == "92":  # Success code
-                                        # Update relay state in database
-                                        if relay_number == 1:
-                                            self.node_model.update_relay_state(node_id, 'relay1_state', relay_state)
-                                        else:
-                                            self.node_model.update_relay_state(node_id, 'relay2_state', relay_state)
-                                        
-                                        # Update relay state in local storage
-                                        # Retrieve the current state of the node from local storage
-                                        current_node = self.node_model.local_storage.get_node(node_id)
-                                        
-                                        # Update the relay state without resetting the other relay state
-                                        node_dict = {
-                                            'node_id': node_id,
-                                            'relay1_state': relay_state if relay_number == 1 else current_node.get('relay1_state', '0'),
-                                            'relay2_state': relay_state if relay_number == 2 else current_node.get('relay2_state', '0'),
-                                            'timestamp': datetime.utcnow().isoformat()
-                                        }
-                                        self.node_model.local_storage.add_node(node_dict)
-                                        return jsonify({
-                                            'message': f'Relay {relay_number} state updated successfully',
-                                            'nodeId': node_id,
-                                            'relayNumber': relay_number,
-                                            'state': relay_state
-                                        }), 200
-                                    elif received_status == "82":  # Error code
-                                        return jsonify({'message': 'Relay control rejected by device'}), 400
-                                
-                            except ValueError as e:
-                                logging.error(f"Error decoding response: {str(e)}")
-                                continue
-                    
+            # Wait for sensor thread to release lock
+            wait_start = time.time()
+            while self.serial_lock.locked() and (time.time() - wait_start) < 5:
                 time.sleep(0.1)
-            
-            return jsonify({'message': 'Timeout waiting for relay response'}), 500
-            
-        except SerialException as e:
-            logging.error(f"Serial port error: {str(e)}")
-            return jsonify({'message': f'Serial port error: {str(e)}'}), 500
+                
+            if not self.serial_lock.acquire(timeout=5):
+                self.pause_sensor_request.clear()
+                return jsonify({'message': 'Could not acquire serial port access'}), 500
+                
+            try:
+                ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=10)
+                logging.info(f"Successfully opened serial port {self.SERIAL_PORT}")
+                
+                # Clear buffers
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                
+                # Format relay command (00 for relay1, 01 for relay2)
+                relay_code = '00' if relay_number == 1 else '01'
+                message = f"{node_id}{self.GATEWAY_ID}{state}{relay_code}{relay_state}"
+                hex_message = binascii.hexlify(message.encode('ascii')).decode('ascii')
+                
+                # Format AT command
+                at_command = f"AT+PSEND={hex_message}\r\n"
+                logging.debug(f"Sending command: {at_command}")
+                
+                # Send command
+                ser.write(at_command.encode('ascii'))
+                ser.flush()
+                
+                # Wait for response
+                start_time = time.time()
+                response_received = False
+                
+                while (time.time() - start_time) < 10 and not response_received:
+                    if ser.in_waiting:
+                        response = ser.readline().decode('ascii').strip()
+                        logging.debug(f"Received response: {response}")
+                        
+                        if "EVT:RXP2P" in response:
+                            parts = response.split(':')
+                            if len(parts) >= 5:
+                                hex_data = parts[4].strip()
+                                try:
+                                    ascii_response = self.decode_hex_response(hex_data)
+                                    if not ascii_response:
+                                        continue
+                                        
+                                    received_node_id = ascii_response[7:14]
+                                    received_status = ascii_response[14:]
+                                    
+                                    if received_node_id == node_id:
+                                        if received_status == "92":  # Success code
+                                            response_received = True
+                                            # Update relay state in database and local storage
+                                            self.node_model.update_relay_state(node_id, f'relay{relay_number}_state', relay_state)
+                                            return jsonify({
+                                                'message': f'Relay {relay_number} state updated successfully',
+                                                'nodeId': node_id,
+                                                'relayNumber': relay_number,
+                                                'state': relay_state
+                                            }), 200
+                                        elif received_status == "82":  # Error code
+                                            response_received = True
+                                            return jsonify({'message': 'Relay control rejected by device'}), 400
+                                            
+                                except ValueError as e:
+                                    logging.error(f"Error decoding response: {str(e)}")
+                                    continue
+                                    
+                        time.sleep(0.1)
+                        
+                return jsonify({'message': 'Timeout waiting for relay response'}), 500
+                
+            except SerialException as e:
+                logging.error(f"Serial port error: {str(e)}")
+                return jsonify({'message': f'Serial port error: {str(e)}'}), 500
+            finally:
+                if 'ser' in locals():
+                    ser.close()
+                    
         except Exception as e:
             logging.error(f"Unexpected error: {str(e)}")
             return jsonify({'message': f'Error controlling relay: {str(e)}'}), 500
         finally:
-            if 'ser' in locals():
-                ser.close()
+            self.serial_lock.release()
+            self.pause_sensor_request.clear()
 
 
     def periodic_sensor_data_request(self):
