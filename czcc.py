@@ -356,10 +356,9 @@ class NodeController:
 
         try:
             # Wait for any ongoing sensor requests to complete
-            wait_start =time.time()
-            while self.serial_lock.locked() and (time.time()- wait_start)<5:
+            wait_start = time.time()
+            while self.serial_lock.locked() and (time.time() - wait_start) < 5:
                 time.sleep(1)
-            
             
             # Try to acquire the lock with timeout
             if not self.serial_lock.acquire(timeout=10):
@@ -376,46 +375,70 @@ class NodeController:
                 
                 # Format unenroll command
                 message = f"{node_id}{self.GATEWAY_ID}{state}"
-                hex_message = message.encode('ascii').hex()
+                hex_message = self.encode_message(message)
                 at_command = f"AT+PSEND={hex_message}\r\n"
-                logging.debug(f"Sending command: {at_command}")
+                logging.debug(f"Sending unenroll command: {at_command}")
+                logging.debug(f"Original message: {message}")
+                logging.debug(f"Hex message: {hex_message}")
                 
                 # Send command
                 ser.write(at_command.encode('ascii'))
                 ser.flush()
-                logging.info("unenroll send")
+                logging.info("Unenroll command sent")
+                
+                # Small delay to allow the command to be sent and device to process
+                time.sleep(0.5)
                 
                 # Wait for response
                 start_time = time.time()
-                while (time.time() - start_time) < 15:  # 10 second timeout
+                response_received = False
+                
+                while (time.time() - start_time) < 15 and not response_received:  # 15 second timeout
                     if ser.in_waiting:
                         response = ser.readline().decode('ascii').strip()
-                        logging.debug(f"Received response: {response}")
+                        logging.debug(f"Received raw response: {response}")
                         
                         if "EVT:RXP2P" in response:
                             parts = response.split(':')
                             if len(parts) >= 5:
                                 hex_data = parts[4].strip()
+                                logging.debug(f"Extracted hex data: {hex_data}")
+                                
                                 try:
-                                    ascii_response = bytes.fromhex(hex_data).decode('ascii')
+                                    ascii_response = self.decode_hex_response(hex_data)
+                                    if not ascii_response:
+                                        logging.error("Failed to decode hex response")
+                                        continue
+                                        
+                                    logging.debug(f"Decoded ASCII response: {ascii_response}")
+                                    
+                                    # Extract fields (first 7 chars are gateway_id, next 7 are node_id)
                                     received_gateway_id = ascii_response[:7]
                                     received_node_id = ascii_response[7:14]
                                     received_status = ascii_response[14:]
                                     
+                                    logging.debug(f"Parsed response - Gateway ID: {received_gateway_id}, Node ID: {received_node_id}, Status: {received_status}")
+                                    
                                     if received_gateway_id == self.GATEWAY_ID and received_node_id == node_id:
                                         if received_status == "97":  # Acknowledge code
+                                            response_received = True
                                             # Remove node from database and local storage
                                             self.node_model.objects(node_id=node_id).delete()
                                             self.node_model.local_storage.remove_node(node_id)
                                             return jsonify({'message': 'Node unenrolled successfully'}), 200
                                         elif received_status == "87":  # Error code
+                                            response_received = True
                                             return jsonify({'message': 'Node unenrollment rejected by device'}), 400
+                                    else:
+                                        logging.warning(f"Received unexpected IDs. Expected Gateway: {self.GATEWAY_ID}, Node: {node_id}. Got Gateway: {received_gateway_id}, Node: {received_node_id}")
                                 except ValueError as e:
                                     logging.error(f"Error decoding response: {str(e)}")
                                     continue
-                time.sleep(0.1)
+                    time.sleep(0.1)
                 
-                return jsonify({'message': 'Timeout waiting for node response'}), 500
+                if not response_received:
+                    logging.warning("No valid response received within timeout period")
+                    return jsonify({'message': 'Timeout waiting for node response'}), 500
                 
             except SerialException as e:
                 logging.error(f"Serial port error: {str(e)}")
@@ -433,5 +456,3 @@ class NodeController:
 
 
 __all__ = ['NodeController']
-
-
